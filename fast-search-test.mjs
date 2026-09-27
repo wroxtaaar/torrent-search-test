@@ -453,6 +453,121 @@ function startMetadataAttempt(normalizedMagnet, plan, attempt, keepActive, overa
   };
 }
 
+async function resolveMetadataFromCache(normalizedMagnet, infoHash, keepActive) {
+  const started = performance.now();
+  const cacheUrl = 'https://itorrents.net/torrent/' + infoHash.toUpperCase() + '.torrent';
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  let metadataClient = null;
+  let torrent = null;
+
+  try {
+    const response = await fetch(cacheUrl, {
+      signal: controller.signal,
+      redirect: 'follow',
+      headers: {
+        'user-agent': 'TorrentStudio-FastSearchTest/1.0',
+        'accept': 'application/x-bittorrent,application/octet-stream,*/*'
+      }
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+    const body = new Uint8Array(await response.arrayBuffer());
+
+    // A cached torrent is small; reject obvious HTML/error pages before handing
+    // the bytes to WebTorrent.
+    if (body.length < 32 || contentType.includes('text/html')) {
+      return null;
+    }
+
+    metadataClient = createMetadataClient(1);
+    torrent = metadataClient.add(body, {
+      paused: true,
+      deselect: true,
+      path: '/tmp/torrent-studio-metadata/cache-' + infoHash
+    });
+
+    const metadata = await new Promise((resolve, reject) => {
+      let settled = false;
+      const fail = error => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      };
+
+      const timeout = setTimeout(() => {
+        fail(new Error('Cached .torrent metadata timed out'));
+      }, 5000);
+
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        const totalElapsedMs = elapsed(started);
+        resolve({
+          ...metadataFromTorrent(torrent, totalElapsedMs, normalizedMagnet),
+          attempts: 0,
+          trackerCount: 0,
+          attemptElapsedMs: totalElapsedMs,
+          metadataSource: 'itorrents-cache'
+        });
+      };
+
+      torrent.on('metadata', done);
+      torrent.on('ready', done);
+      torrent.on('error', fail);
+      metadataClient.on('error', fail);
+
+      // client.add(.torrent) normally has metadata synchronously available,
+      // but keep the events above for version-safe handling.
+      if (torrent.ready) done();
+    });
+
+    if (metadata.infoHash !== infoHash) {
+      throw new Error('Cached .torrent infohash mismatch');
+    }
+
+    console.log('[METADATA] cache hit', {
+      infoHash,
+      elapsedMs: metadata.elapsedMs,
+      bytes: body.length
+    });
+
+    if (keepActive) {
+      active.set(infoHash, { torrent, client: metadataClient, createdAt: Date.now(), metadata });
+
+      const cleanupTimer = setTimeout(() => {
+        const entry = active.get(infoHash);
+        if (entry?.torrent === torrent) {
+          active.delete(infoHash);
+          void destroyTorrent(torrent).then(() => destroyMetadataClient(entry.client));
+        }
+      }, 10 * 60 * 1000);
+      cleanupTimer.unref?.();
+      torrent = null;
+      metadataClient = null;
+    }
+
+    return metadata;
+  } catch (error) {
+    console.log('[METADATA] cache miss', {
+      infoHash,
+      elapsedMs: elapsed(started),
+      error: error?.message || String(error)
+    });
+    return null;
+  } finally {
+    clearTimeout(timer);
+    if (torrent) await destroyTorrent(torrent);
+    if (metadataClient) await destroyMetadataClient(metadataClient);
+  }
+}
+
 async function resolveMetadataFresh(normalizedMagnet, infoHash, keepActive) {
   const started = performance.now();
   const plans = metadataPlans();
@@ -593,7 +708,7 @@ async function resolveMetadata(magnet, keepActive = true) {
 
   const cached = active.get(infoHash);
   if (cached?.metadata) {
-    console.log('[METADATA] cache hit:', infoHash);
+    console.log('[METADATA] active cache hit:', infoHash);
     return cached.metadata;
   }
 
@@ -603,11 +718,16 @@ async function resolveMetadata(magnet, keepActive = true) {
     return existing;
   }
 
-  const promise = resolveMetadataFresh(normalizedMagnet, infoHash, keepActive)
-    .finally(() => {
-      metadataPromises.delete(infoHash);
-      metadataInFlight = metadataPromises.size > 0;
-    });
+  const promise = (async () => {
+    const cachedMetadata = await resolveMetadataFromCache(normalizedMagnet, infoHash, keepActive);
+    if (cachedMetadata) return cachedMetadata;
+
+    console.log('[METADATA] falling back to P2P resolver:', infoHash);
+    return resolveMetadataFresh(normalizedMagnet, infoHash, keepActive);
+  })().finally(() => {
+    metadataPromises.delete(infoHash);
+    metadataInFlight = metadataPromises.size > 0;
+  });
 
   metadataPromises.set(infoHash, promise);
   metadataInFlight = true;
