@@ -57,6 +57,42 @@ function makeMagnet(infoHash, name) {
   return 'magnet:?' + params.toString();
 }
 
+function normalizeMagnet(input) {
+  const raw = String(input || '').trim();
+  if (!/^magnet:\?/i.test(raw)) {
+    throw new Error('A valid magnet URI is required');
+  }
+
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error('Invalid magnet URI');
+  }
+
+  const xt = url.searchParams.get('xt') || '';
+  const match = xt.match(/^urn:btih:([a-f0-9]{40})$/i);
+  if (!match) {
+    throw new Error('Magnet must contain a valid 40-character BTIH infohash');
+  }
+
+  const name = url.searchParams.get('dn') || '';
+  const params = new URLSearchParams();
+  params.set('xt', 'urn:btih:' + match[1].toLowerCase());
+  if (name) params.set('dn', name);
+
+  // Controlled experiment: deliberately discard every incoming tr= value.
+  const normalized = 'magnet:?' + params.toString();
+
+  console.log('[MAGNET] normalized', {
+    infoHash: match[1].toLowerCase(),
+    name: name.slice(0, 120),
+    droppedTrackers: url.searchParams.getAll('tr').length
+  });
+
+  return normalized;
+}
+
 async function fetchJson(url, timeoutMs = SEARCH_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -200,7 +236,8 @@ function metadataFromTorrent(torrent, elapsedMs, sourceMagnet) {
 }
 
 async function resolveMetadata(magnet, keepActive = true) {
-  if (!/^magnet:\?/i.test(magnet)) throw new Error('A valid magnet URI is required');
+  const normalizedMagnet = normalizeMagnet(magnet);
+
   if (metadataInFlight) throw new Error('Another metadata request is already running. Please wait for it to finish.');
 
   const started = performance.now();
@@ -232,6 +269,9 @@ async function resolveMetadata(magnet, keepActive = true) {
       metadataDiagnostics.elapsedMs = elapsed(started);
       console.error('[METADATA]', {
         phase,
+        infoHash: metadataDiagnostics.infoHash,
+        peers: metadataDiagnostics.peers,
+        wires: metadataDiagnostics.wires,
         elapsedMs: elapsed(started),
         error: error?.message || String(error)
       });
@@ -243,10 +283,10 @@ async function resolveMetadata(magnet, keepActive = true) {
 
     try {
       phase = 'adding';
-      torrent = client.add(magnet, {
+      torrent = client.add(normalizedMagnet, {
         paused: true,
         dht: true,
-        tracker: true,
+        tracker: false,
         maxConns: METADATA_MAX_CONNS,
         path: '/tmp/torrent-studio-metadata'
       });
@@ -257,6 +297,7 @@ async function resolveMetadata(magnet, keepActive = true) {
         metadataDiagnostics.infoHash = torrent.infoHash;
         console.log('[METADATA] infoHash discovered:', torrent.infoHash);
       });
+
       torrent.on('wire', wire => {
         phase = 'peer-connected';
         metadataDiagnostics.phase = phase;
@@ -273,7 +314,7 @@ async function resolveMetadata(magnet, keepActive = true) {
         metadataDiagnostics.elapsedMs = elapsed(started);
         const elapsedMs = elapsed(started);
         try { torrent.pause(); } catch {}
-        const metadata = metadataFromTorrent(torrent, elapsedMs, magnet);
+        const metadata = metadataFromTorrent(torrent, elapsedMs, normalizedMagnet);
         clearTimeout(timeout);
 
         if (keepActive) {
@@ -374,7 +415,7 @@ app.get('/api/active', (_req, res) => {
 const server = app.listen(PORT, HOST, () => {
   console.log('[FAST TEST] listening on http://' + HOST + ':' + PORT);
   console.log('[FAST TEST] search sources: torrents-csv' + (APIBAY_ENABLED ? ', apibay' : ''));
-  console.log('[FAST TEST] WebTorrent DHT/tracker metadata resolver ready');
+  console.log('[FAST TEST] WebTorrent DHT-only metadata resolver ready');
 });
 
 function shutdown() {
