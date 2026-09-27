@@ -298,7 +298,7 @@ function destroyTorrent(torrent) {
   });
 }
 
-async function resolveMetadataAttempt(normalizedMagnet, trackers, attempt, keepActive, overallStarted, infoHash) {
+async function resolveMetadataAttempt(normalizedMagnet, trackers, attempt, attemptTimeoutMs, keepActive, overallStarted, infoHash) {
   const attemptStarted = performance.now();
   const attemptMagnet = buildMagnetWithTrackers(normalizedMagnet, trackers);
 
@@ -335,8 +335,8 @@ async function resolveMetadataAttempt(normalizedMagnet, trackers, attempt, keepA
     };
 
     const timeout = setTimeout(() => {
-      void fail(new Error('Metadata attempt timed out after ' + METADATA_ATTEMPT_TIMEOUT_MS + 'ms'));
-    }, METADATA_ATTEMPT_TIMEOUT_MS);
+      void fail(new Error('Metadata attempt timed out after ' + attemptTimeoutMs + 'ms'));
+    }, attemptTimeoutMs);
     timeout.unref?.();
 
     try {
@@ -362,8 +362,13 @@ async function resolveMetadataAttempt(normalizedMagnet, trackers, attempt, keepA
         console.log('[METADATA] peer connected; peers:', torrent.numPeers);
       });
 
+      let discoveredPeers = 0;
       torrent.on('peer', peer => {
-        console.log('[TRACKER] peer discovered:', peer?.id || peer);
+        discoveredPeers += 1;
+        metadataDiagnostics.discoveredPeers = discoveredPeers;
+        if (discoveredPeers <= 3 || discoveredPeers % 10 === 0) {
+          console.log('[TRACKER] peer discovered:', discoveredPeers, peer?.id || peer);
+        }
       });
 
       torrent.on('noPeers', announceType => {
@@ -433,6 +438,7 @@ async function resolveMetadataFresh(normalizedMagnet, infoHash, keepActive) {
     infoHash,
     peers: 0,
     wires: 0,
+    discoveredPeers: 0,
     warnings: 0,
     attempt: 0,
     maxAttempts: plans.length,
@@ -442,11 +448,17 @@ async function resolveMetadataFresh(normalizedMagnet, infoHash, keepActive) {
   };
 
   for (let i = 0; i < plans.length; i += 1) {
+    const remainingMs = METADATA_TIMEOUT_MS - elapsed(started);
+    if (remainingMs <= 0) break;
+
+    const attemptTimeoutMs = Math.min(METADATA_ATTEMPT_TIMEOUT_MS, remainingMs);
+
     try {
       return await resolveMetadataAttempt(
         normalizedMagnet,
         plans[i],
         i + 1,
+        attemptTimeoutMs,
         keepActive,
         started,
         infoHash
@@ -454,13 +466,19 @@ async function resolveMetadataFresh(normalizedMagnet, infoHash, keepActive) {
     } catch (error) {
       lastError = error;
       if (i + 1 < plans.length) {
+        const afterAttemptMs = elapsed(started);
+        if (afterAttemptMs >= METADATA_TIMEOUT_MS) break;
+
         metadataDiagnostics.phase = 'retrying';
-        metadataDiagnostics.elapsedMs = elapsed(started);
+        metadataDiagnostics.elapsedMs = afterAttemptMs;
         console.warn('[METADATA] retrying with tracker fallback', {
           nextAttempt: i + 2,
-          elapsedMs: elapsed(started)
+          elapsedMs: afterAttemptMs,
+          remainingMs: METADATA_TIMEOUT_MS - afterAttemptMs
         });
-        if (METADATA_RETRY_DELAY_MS > 0) await sleep(METADATA_RETRY_DELAY_MS);
+        if (METADATA_RETRY_DELAY_MS > 0) {
+          await sleep(Math.min(METADATA_RETRY_DELAY_MS, METADATA_TIMEOUT_MS - afterAttemptMs));
+        }
       }
     }
   }
