@@ -32,18 +32,89 @@ button{background:#e9edf2;color:#111;border:0;border-radius:9px;padding:11px 15p
 <div class="row"><input id="magnet" placeholder="Paste magnet:?xt=urn:btih:..."><button id="magnetBtn">Get Metadata</button></div>
 <div id="magnetStatus" class="status"></div><div id="metadata"></div>
 </section>
-<section><h2>3. Diagnostics</h2><div id="health" class="status">Checking...</div></section>
+<section>
+<h2>3. Background metadata</h2>
+<div class="small">Slow metadata jobs keep working for up to 6 hours. Completed jobs stay available for review.</div>
+<div id="backgroundJobs" class="status">No background jobs.</div>
+</section>
+<section><h2>4. Diagnostics</h2><div id="health" class="status">Checking...</div></section>
 </main>
 <script>
 const $=id=>document.getElementById(id);
 function formatBytes(n){if(!Number.isFinite(n)||n<=0)return'—';const u=['B','KB','MB','GB','TB'];let i=0,v=n;while(v>=1024&&i<u.length-1){v/=1024;i++;}return v.toFixed(v>=100?0:v>=10?1:2)+' '+u[i]}
 function escapeHtml(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function renderMetadata(data,container){container.innerHTML='';const card=document.createElement('div');card.className='card';card.innerHTML='<div class="title">'+escapeHtml(data.name)+'</div><div class="meta"><span class="pill">'+data.fileCount+' files</span><span class="pill">'+formatBytes(data.totalSize)+'</span><span class="pill">'+data.elapsedMs+' ms</span><span class="pill">'+data.peersAtMetadata+' peers</span></div><div class="small">Info hash: '+escapeHtml(data.infoHash)+'</div><div class="files">'+data.files.map(f=>'<div class="file"><b>#'+f.index+'</b> '+escapeHtml(f.path||f.name)+' <span class="small">('+formatBytes(f.size)+')</span></div>').join('')+'</div>';container.appendChild(card)}
+function renderMetadata(data,container){
+  const card=document.createElement('div');
+  card.className='card';
+  card.innerHTML='<div class="title">'+escapeHtml(data.name)+'</div><div class="meta"><span class="pill">'+data.fileCount+' files</span><span class="pill">'+formatBytes(data.totalSize)+'</span><span class="pill">'+(data.elapsedMs??'—')+' ms</span><span class="pill">'+(data.peersAtMetadata??0)+' peers</span></div><div class="small">Info hash: '+escapeHtml(data.infoHash)+'</div><div class="files">'+data.files.map(f=>'<div class="file"><b>#'+f.index+'</b> '+escapeHtml(f.path||f.name)+' <span class="small">('+formatBytes(f.size)+')</span></div>').join('')+'</div>';
+  container.replaceChildren(card);
+}
+function formatDuration(ms){
+  const total=Math.max(0,Math.floor(Number(ms||0)/1000));
+  const h=Math.floor(total/3600),m=Math.floor((total%3600)/60),sec=total%60;
+  if(h)return h+'h '+m+'m';
+  if(m)return m+'m '+sec+'s';
+  return sec+'s';
+}
+const activeJobIds=new Set();
+let jobPoller=null;
+function renderBackgroundJob(job){
+  const host=$('backgroundJobs');
+  let card=document.querySelector('[data-job-id="'+job.jobId+'"]');
+  if(!card){card=document.createElement('div');card.className='card';card.dataset.jobId=job.jobId;host.appendChild(card);}
+  const terminal=job.status==='completed'||job.status==='failed';
+  const elapsed=job.elapsedMs||Math.max(0,Date.now()-new Date(job.startedAt||job.createdAt).getTime());
+  const label=job.status==='completed'?'✓ Completed':job.status==='failed'?'✗ Failed':'⟳ Resolving';
+  card.innerHTML='<div class="title">'+escapeHtml(job.name||job.infoHash)+'</div><div class="meta"><span class="pill">'+label+'</span><span class="pill">'+formatDuration(elapsed)+'</span><span class="pill">rounds: '+job.rounds+'</span></div><div class="small">Info hash: '+escapeHtml(job.infoHash)+'</div>'+
+    (job.status==='resolving'?'<div class="small">Working until '+escapeHtml(new Date(job.deadlineAt).toLocaleString())+'</div>':'')+
+    (job.status==='failed'?'<div class="bad">'+escapeHtml(job.error||'Metadata resolution failed')+'</div>':'')+
+    (job.status==='completed'&&job.metadata?'<div class="files-host"></div>':'');
+  if(job.status==='completed'&&job.metadata)renderMetadata(job.metadata,card.querySelector('.files-host'));
+}
+async function refreshBackgroundJobs(){
+  try{
+    const r=await fetch('/api/metadata-jobs');
+    const d=await r.json();
+    if(!r.ok)throw new Error(d.error||'Background job request failed');
+    if(!d.jobs.length){
+      $('backgroundJobs').textContent='No background jobs.';
+    }else{
+      for(const job of d.jobs)renderBackgroundJob(job);
+    }
+    activeJobIds.clear();
+    for(const job of d.jobs)if(job.status==='resolving')activeJobIds.add(job.jobId);
+    if(activeJobIds.size&&!jobPoller)jobPoller=setInterval(refreshBackgroundJobs,3000);
+    if(!activeJobIds.size&&jobPoller){clearInterval(jobPoller);jobPoller=null;}
+  }catch(e){console.warn('Background jobs:',e.message);}
+}
+function startBackgroundJob(job){
+  activeJobIds.add(job.jobId);
+  renderBackgroundJob(job);
+  if(!jobPoller)jobPoller=setInterval(refreshBackgroundJobs,3000);
+}
 function openMagnet(magnet,button,status){if(button)button.disabled=true;if(status)status.innerHTML='<span class="good">✓ Magnet ready — opening torrent client...</span>';window.location.href=magnet;setTimeout(()=>{if(button)button.disabled=false},1500)}
-async function addMagnet(magnet,button,status,container){const started=performance.now();button.disabled=true;status.textContent='Resolving torrent metadata...';container.innerHTML='';try{const r=await fetch('/api/metadata',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({magnet})});const d=await r.json();if(!r.ok)throw new Error(d.error||'Metadata request failed');const clientMs=Math.round(performance.now()-started);status.innerHTML='<span class="good">✓ Metadata received in '+clientMs+' ms browser time ('+d.elapsedMs+' ms server resolver time)</span>';renderMetadata(d,container)}catch(e){status.innerHTML='<span class="bad">✗ '+escapeHtml(e.message)+'</span>'}finally{button.disabled=false}}
+async function addMagnet(magnet,button,status){
+  button.disabled=true;
+  status.textContent='Starting metadata resolver...';
+  try{
+    const r=await fetch('/api/metadata',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({magnet})});
+    const d=await r.json();
+    if(!r.ok)throw new Error(d.error||'Metadata request failed');
+    if(d.status==='completed'){
+      status.innerHTML='<span class="good">✓ Metadata ready.</span>';
+      $('metadata').innerHTML='';
+      renderMetadata(d,$('metadata'));
+      return;
+    }
+    status.innerHTML='<span class="good">✓ Resolver running in the background for up to 6 hours.</span>';
+    startBackgroundJob(d);
+  }catch(e){
+    status.innerHTML='<span class="bad">✗ '+escapeHtml(e.message)+'</span>';
+  }finally{button.disabled=false}
+}
 $('searchBtn').onclick=async()=>{const q=$('query').value.trim();if(q.length<2)return;const started=performance.now();$('searchBtn').disabled=true;$('searchStatus').textContent='Searching...';$('results').innerHTML='';try{const r=await fetch('/api/search?q='+encodeURIComponent(q)+'&limit=30');const d=await r.json();if(!r.ok)throw new Error(d.error||'Search failed');$('searchStatus').textContent=d.results.length+' results in '+Math.round(performance.now()-started)+' ms browser time / '+d.elapsedMs+' ms server time\n'+d.providers.map(p=>p.source+': '+p.elapsedMs+' ms, '+p.resultCount+' results'+(p.error?' ('+p.error+')':'')).join(' | ');for(const result of d.results){const card=document.createElement('div');card.className='card';card.innerHTML='<div class="title">'+escapeHtml(result.title)+'</div><div class="meta"><span class="pill">'+escapeHtml(result.source)+'</span><span class="pill">'+formatBytes(result.size)+'</span><span class="pill">↑ '+result.seeders+'</span><span class="pill">↓ '+result.leechers+'</span></div><button class="add">Add Torrent</button>';card.querySelector('.add').onclick=()=>openMagnet(result.magnet,card.querySelector('.add'),$('magnetStatus'));$('results').appendChild(card)}}catch(e){$('searchStatus').innerHTML='<span class="bad">✗ '+escapeHtml(e.message)+'</span>'}finally{$('searchBtn').disabled=false}};
 $('query').addEventListener('keydown',e=>{if(e.key==='Enter')$('searchBtn').click()});
-$('magnetBtn').onclick=()=>{const magnet=$('magnet').value.trim();if(!magnet)return;addMagnet(magnet,$('magnetBtn'),$('magnetStatus'),$('metadata'))};
+$('magnetBtn').onclick=()=>{const magnet=$('magnet').value.trim();if(!magnet)return;addMagnet(magnet,$('magnetBtn'),$('magnetStatus'))};
 async function health(){try{const r=await fetch('/health');const d=await r.json();$('health').innerHTML='<span class="good">✓ '+escapeHtml(d.service)+'</span>\nWebTorrent: '+d.webtorrent+'\nActive metadata torrents: '+d.activeTorrents+'\nUptime: '+d.uptimeSeconds+'s'}catch{$('health').innerHTML='<span class="bad">✗ Health check failed</span>'}}health();
 </script>
 </body>
