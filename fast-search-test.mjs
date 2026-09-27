@@ -9,7 +9,7 @@ app.use(express.json({ limit: '256kb' }));
 
 const SEARCH_TIMEOUT_MS = Number(process.env.SEARCH_TIMEOUT_MS || 2500);
 const METADATA_TIMEOUT_MS = Number(process.env.METADATA_TIMEOUT_MS || 20000);
-const METADATA_MAX_CONNS = Number(process.env.METADATA_MAX_CONNS || 50);
+const METADATA_MAX_CONNS = Number(process.env.METADATA_MAX_CONNS || 100);
 const APIBAY_ENABLED = process.env.ENABLE_APIBAY !== 'false';
 const TORRENTS_CSV_URL = 'https://torrents-csv.com/service/search';
 const APIBAY_URL = 'https://apibay.org/q.php';
