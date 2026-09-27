@@ -299,6 +299,29 @@ async function resolveMetadata(magnet, keepActive = true) {
         path: '/tmp/torrent-studio-metadata'
       });
 
+      // Instrument WebTorrent's tracker lifecycle so we can distinguish
+      // tracker discovery from peer connection failures.
+      torrent.on('trackerAnnounce', tracker => {
+        console.log('[TRACKER] announce:', tracker?.url || tracker);
+      });
+      torrent.on('trackerWarning', (error, tracker) => {
+        console.warn('[TRACKER] warning:', tracker?.url || tracker, error?.message || error);
+      });
+      torrent.on('trackerError', (error, tracker) => {
+        console.error('[TRACKER] error:', tracker?.url || tracker, error?.message || error);
+      });
+      torrent.on('trackerUpdate', (data, tracker) => {
+        console.log('[TRACKER] update:', {
+          tracker: tracker?.url || tracker,
+          complete: data?.complete,
+          incomplete: data?.incomplete,
+          peers: Array.isArray(data?.peers) ? data.peers.length : null
+        });
+      });
+      torrent.on('peer', peer => {
+        console.log('[TRACKER] peer discovered:', peer?.id || peer);
+      });
+
       torrent.on('infoHash', () => {
         phase = 'discovering';
         metadataDiagnostics.phase = phase;
