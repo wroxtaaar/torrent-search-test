@@ -81,7 +81,10 @@ function normalizeMagnet(input) {
   params.set('xt', 'urn:btih:' + match[1].toLowerCase());
   if (name) params.set('dn', name);
 
-  // Controlled experiment: deliberately discard every incoming tr= value.
+  // Keep a small known-good tracker set in the magnet so parse-torrent
+  // recognizes it as a complete magnet. Tracker networking is disabled
+  // separately in client.add() for the DHT-only experiment.
+  for (const tracker of TRACKERS) params.append('tr', tracker);
   const normalized = 'magnet:?' + params.toString();
 
   console.log('[MAGNET] normalized', {
