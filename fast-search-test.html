@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Torrent Studio — Fast Search Test</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+body{margin:0;background:#0b0d10;color:#eef1f4}main{max-width:1100px;margin:0 auto;padding:24px}
+h1{margin:0 0 6px;font-size:24px}.sub{color:#8e98a4;margin-bottom:24px}
+section{background:#13171c;border:1px solid #252b33;border-radius:14px;padding:18px;margin:14px 0}
+.row{display:flex;gap:10px}input{flex:1;min-width:0;background:#0c0f13;color:#fff;border:1px solid #343c47;border-radius:9px;padding:12px;font-size:15px}
+button{background:#e9edf2;color:#111;border:0;border-radius:9px;padding:11px 15px;font-weight:700;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}
+.status{margin-top:12px;color:#9eabb8;white-space:pre-wrap}.card{border:1px solid #29313a;border-radius:11px;padding:13px;margin:9px 0}
+.title{font-weight:700;line-height:1.35}.meta{color:#9eabb8;font-size:13px;margin:5px 0 10px}.small{font-size:12px;color:#778390}
+.files{margin-top:14px}.file{padding:7px 0;border-top:1px solid #20262d;font-size:13px}
+.pill{display:inline-block;border:1px solid #39434f;border-radius:999px;padding:3px 7px;margin-right:5px;font-size:11px}
+.good{color:#83d79b}.bad{color:#ff8585}
+</style>
+</head>
+<body>
+<main>
+<h1>⚡ Torrent Studio — Fast Search / Metadata Test</h1>
+<div class="sub">Isolated experiment. No qBittorrent, Oracle VPS, Redis, database, Prowlarr, or existing Torrent Studio logic.</div>
+<section>
+<h2>1. Search</h2>
+<div class="row"><input id="query" placeholder="Search torrents..." autocomplete="off"><button id="searchBtn">Search</button></div>
+<div id="searchStatus" class="status"></div><div id="results"></div>
+</section>
+<section>
+<h2>2. Direct magnet → metadata</h2>
+<div class="row"><input id="magnet" placeholder="Paste magnet:?xt=urn:btih:..."><button id="magnetBtn">Get Metadata</button></div>
+<div id="magnetStatus" class="status"></div><div id="metadata"></div>
+</section>
+<section><h2>3. Diagnostics</h2><div id="health" class="status">Checking...</div></section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+function formatBytes(n){if(!Number.isFinite(n)||n<=0)return'—';const u=['B','KB','MB','GB','TB'];let i=0,v=n;while(v>=1024&&i<u.length-1){v/=1024;i++;}return v.toFixed(v>=100?0:v>=10?1:2)+' '+u[i]}
+function escapeHtml(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function renderMetadata(data,container){container.innerHTML='';const card=document.createElement('div');card.className='card';card.innerHTML='<div class="title">'+escapeHtml(data.name)+'</div><div class="meta"><span class="pill">'+data.fileCount+' files</span><span class="pill">'+formatBytes(data.totalSize)+'</span><span class="pill">'+data.elapsedMs+' ms</span><span class="pill">'+data.peersAtMetadata+' peers</span></div><div class="small">Info hash: '+escapeHtml(data.infoHash)+'</div><div class="files">'+data.files.map(f=>'<div class="file"><b>#'+f.index+'</b> '+escapeHtml(f.path||f.name)+' <span class="small">('+formatBytes(f.size)+')</span></div>').join('')+'</div>';container.appendChild(card)}
+async function addMagnet(magnet,button,status,container){const started=performance.now();button.disabled=true;status.textContent='Resolving torrent metadata...';container.innerHTML='';try{const r=await fetch('/api/add',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({magnet})});const d=await r.json();if(!r.ok)throw new Error(d.error||'Metadata request failed');const clientMs=Math.round(performance.now()-started);status.innerHTML='<span class="good">✓ Metadata received in '+clientMs+' ms browser time ('+d.elapsedMs+' ms server resolver time)</span>';renderMetadata(d,container)}catch(e){status.innerHTML='<span class="bad">✗ '+escapeHtml(e.message)+'</span>'}finally{button.disabled=false}}
+$('searchBtn').onclick=async()=>{const q=$('query').value.trim();if(q.length<2)return;const started=performance.now();$('searchBtn').disabled=true;$('searchStatus').textContent='Searching...';$('results').innerHTML='';try{const r=await fetch('/api/search?q='+encodeURIComponent(q)+'&limit=30');const d=await r.json();if(!r.ok)throw new Error(d.error||'Search failed');$('searchStatus').textContent=d.results.length+' results in '+Math.round(performance.now()-started)+' ms browser time / '+d.elapsedMs+' ms server time\n'+d.providers.map(p=>p.source+': '+p.elapsedMs+' ms, '+p.resultCount+' results'+(p.error?' ('+p.error+')':'')).join(' | ');for(const result of d.results){const card=document.createElement('div');card.className='card';card.innerHTML='<div class="title">'+escapeHtml(result.title)+'</div><div class="meta"><span class="pill">'+escapeHtml(result.source)+'</span><span class="pill">'+formatBytes(result.size)+'</span><span class="pill">↑ '+result.seeders+'</span><span class="pill">↓ '+result.leechers+'</span></div><button class="add">Add / Get Metadata</button>';card.querySelector('.add').onclick=()=>addMagnet(result.magnet,card.querySelector('.add'),$('magnetStatus'),$('metadata'));$('results').appendChild(card)}}catch(e){$('searchStatus').innerHTML='<span class="bad">✗ '+escapeHtml(e.message)+'</span>'}finally{$('searchBtn').disabled=false}};
+$('query').addEventListener('keydown',e=>{if(e.key==='Enter')$('searchBtn').click()});
+$('magnetBtn').onclick=()=>{const magnet=$('magnet').value.trim();if(!magnet)return;addMagnet(magnet,$('magnetBtn'),$('magnetStatus'),$('metadata'))};
+async function health(){try{const r=await fetch('/health');const d=await r.json();$('health').innerHTML='<span class="good">✓ '+escapeHtml(d.service)+'</span>\nWebTorrent: '+d.webtorrent+'\nActive metadata torrents: '+d.activeTorrents+'\nUptime: '+d.uptimeSeconds+'s'}catch{$('health').innerHTML='<span class="bad">✗ Health check failed</span>'}}health();
+</script>
+</body>
+</html>
