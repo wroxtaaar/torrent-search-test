@@ -32,16 +32,8 @@ const FALLBACK_TRACKERS = [
   'http://tr.nyacat.pw:80/announce'
 ];
 
-const client = new WebTorrent({
-  dht: false,
-  tracker: true,
-  lsd: false,
-  natUpnp: false,
-  natPmp: false,
-  maxConns: METADATA_MAX_CONNS
-});
-
 const active = new Map();
+const metadataClients = new Set();
 const metadataPromises = new Map();
 let metadataInFlight = false;
 let metadataDiagnostics = {
@@ -54,9 +46,46 @@ let metadataDiagnostics = {
   elapsedMs: 0
 };
 
-client.on('error', err => {
-  console.error('[WEBTORRENT] client error:', err?.message || err);
-});
+function createMetadataClient(maxConns) {
+  const metadataClient = new WebTorrent({
+    dht: false,
+    tracker: true,
+    lsd: false,
+    natUpnp: false,
+    natPmp: false,
+    maxConns
+  });
+
+  metadataClients.add(metadataClient);
+  metadataClient.on('error', err => {
+    console.error('[WEBTORRENT] metadata client error:', err?.message || err);
+  });
+
+  return metadataClient;
+}
+
+function destroyMetadataClient(metadataClient) {
+  if (!metadataClient) return Promise.resolve();
+
+  metadataClients.delete(metadataClient);
+
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, 1500);
+
+    try {
+      metadataClient.destroy(finish);
+    } catch {
+      finish();
+    }
+  });
+}
 
 function elapsed(start) {
   return Math.round(performance.now() - start);
@@ -301,6 +330,7 @@ function startMetadataAttempt(normalizedMagnet, plan, attempt, keepActive, overa
   const attemptStarted = performance.now();
   const attemptMagnet = buildMagnetWithTrackers(normalizedMagnet, plan.trackers);
 
+  let metadataClient = null;
   let torrent = null;
   let settled = false;
   let timeout;
@@ -308,6 +338,7 @@ function startMetadataAttempt(normalizedMagnet, plan, attempt, keepActive, overa
   const cleanup = async () => {
     clearTimeout(timeout);
     await destroyTorrent(torrent);
+    await destroyMetadataClient(metadataClient);
   };
 
   const promise = new Promise((resolve, reject) => {
@@ -336,7 +367,11 @@ function startMetadataAttempt(normalizedMagnet, plan, attempt, keepActive, overa
     timeout.unref?.();
 
     try {
-      torrent = client.add(attemptMagnet, {
+      // Each parallel attempt must use its own WebTorrent client.
+      // WebTorrent rejects duplicate infohashes when added to the same client,
+      // even when the torrents use different storage paths.
+      metadataClient = createMetadataClient(plan.maxConns);
+      torrent = metadataClient.add(attemptMagnet, {
         paused: false,
         deselect: true,
         dht: false,
@@ -404,7 +439,7 @@ function startMetadataAttempt(normalizedMagnet, plan, attempt, keepActive, overa
 
         try { torrent.pause(); } catch {}
         onMetadata({ torrent, metadata, attempt, attemptElapsedMs });
-        resolve({ torrent, metadata, attempt });
+        resolve({ torrent, metadata, attempt, client: metadataClient });
       });
     } catch (error) {
       void fail(error);
@@ -469,18 +504,16 @@ async function resolveMetadataFresh(normalizedMagnet, infoHash, keepActive) {
       metadataDiagnostics.attempt = attempt;
 
       if (keepActive) {
-        active.set(infoHash, { torrent, createdAt: Date.now(), metadata });
+        active.set(infoHash, { torrent, client: metadataClient, createdAt: Date.now(), metadata });
 
         const cleanupTimer = setTimeout(() => {
           const entry = active.get(infoHash);
           if (entry?.torrent === torrent) {
             active.delete(infoHash);
-            void destroyTorrent(torrent);
+            void destroyTorrent(torrent).then(() => destroyMetadataClient(entry.client));
           }
         }, 10 * 60 * 1000);
         cleanupTimer.unref?.();
-      } else {
-        await destroyTorrent(torrent);
       }
 
       await finishCleanup(keepActive ? torrent : null);
@@ -696,9 +729,16 @@ const server = app.listen(PORT, HOST, () => {
   console.log('[FAST TEST] WebTorrent HTTP-tracker metadata resolver ready; max connections:', METADATA_MAX_CONNS);
 });
 
-function shutdown() {
+async function shutdown() {
   console.log('[FAST TEST] shutting down');
-  server.close(() => client.destroy(() => process.exit(0)));
+  server.close(async () => {
+    await Promise.all([...metadataClients].map(destroyMetadataClient));
+    for (const entry of active.values()) {
+      await destroyTorrent(entry.torrent);
+      await destroyMetadataClient(entry.client);
+    }
+    process.exit(0);
+  });
 }
 
 process.on('SIGTERM', shutdown);
