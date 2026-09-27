@@ -290,7 +290,11 @@ async function resolveMetadata(magnet, keepActive = true) {
     try {
       phase = 'adding';
       torrent = client.add(normalizedMagnet, {
-        paused: true,
+        // Metadata discovery requires active peer connections. Do not pause
+        // the torrent before peers can be found; deselect all payload pieces
+        // so that receiving metadata cannot start a content download.
+        paused: false,
+        deselect: true,
         dht: true,
         // Allow only the controlled trackers embedded by normalizeMagnet().
         // DHT remains enabled as a second discovery path.
