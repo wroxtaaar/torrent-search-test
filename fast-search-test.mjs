@@ -289,6 +289,7 @@ app.get('/health', (_req, res) => {
     service: 'torrent-studio-fast-search-test',
     webtorrent: '3.0.21',
     activeTorrents: active.size,
+    metadataInFlight,
     uptimeSeconds: Math.round(process.uptime())
   });
 });
