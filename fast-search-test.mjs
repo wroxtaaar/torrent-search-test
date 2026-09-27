@@ -54,7 +54,9 @@ function makeMagnet(infoHash, name) {
   params.set('xt', 'urn:btih:' + infoHash);
   if (name) params.set('dn', name);
   for (const tracker of TRACKERS) params.append('tr', tracker);
-  return 'magnet:?' + params.toString();
+  // parse-torrent expects the BTIH xt value in its canonical unescaped form.
+  // URLSearchParams escapes the colons, so restore only the xt prefix.
+  return 'magnet:?' + params.toString().replace('xt=urn%3Abtih%3A', 'xt=urn:btih:');
 }
 
 function normalizeMagnet(input) {
@@ -85,7 +87,8 @@ function normalizeMagnet(input) {
   // recognizes it as a complete magnet. Tracker networking is disabled
   // separately in client.add() for the DHT-only experiment.
   for (const tracker of TRACKERS) params.append('tr', tracker);
-  const normalized = 'magnet:?' + params.toString();
+  // Keep BTIH in the canonical unescaped form required by parse-torrent.
+  const normalized = 'magnet:?' + params.toString().replace('xt=urn%3Abtih%3A', 'xt=urn:btih:');
 
   console.log('[MAGNET] normalized', {
     infoHash: match[1].toLowerCase(),
