@@ -292,7 +292,9 @@ async function resolveMetadata(magnet, keepActive = true) {
       torrent = client.add(normalizedMagnet, {
         paused: true,
         dht: true,
-        tracker: false,
+        // Allow only the controlled trackers embedded by normalizeMagnet().
+        // DHT remains enabled as a second discovery path.
+        tracker: true,
         maxConns: METADATA_MAX_CONNS,
         path: '/tmp/torrent-studio-metadata'
       });
