@@ -652,14 +652,29 @@ app.post('/api/metadata', async (req, res) => {
   }
 });
 
-app.post('/api/add', async (req, res) => {
+app.post('/api/add', (req, res) => {
   const magnet = String(req.body?.magnet || '').trim();
   if (!magnet) return res.status(400).json({ error: 'magnet is required' });
+
   try {
-    res.json({ ok: true, action: 'added-paused', ...(await resolveMetadata(magnet, true)) });
+    const normalizedMagnet = normalizeMagnet(magnet);
+    const url = new URL(normalizedMagnet);
+    const infoHash = (url.searchParams.get('xt') || '').replace(/^urn:btih:/i, '').toLowerCase();
+    const name = url.searchParams.get('dn') || '';
+
+    // 1337x-style fast path: do not resolve metadata here.
+    // Return the magnet immediately and let the user's torrent client handle
+    // metadata/peer discovery after the handoff.
+    res.json({
+      ok: true,
+      action: 'magnet-ready',
+      magnet: normalizedMagnet,
+      infoHash,
+      name
+    });
   } catch (error) {
     console.error('[ADD]', error);
-    res.status(504).json({ ok: false, error: error?.message || 'Add failed' });
+    res.status(400).json({ ok: false, error: error?.message || 'Invalid magnet' });
   }
 });
 
