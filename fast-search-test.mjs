@@ -407,6 +407,53 @@ app.post('/api/add', async (req, res) => {
   }
 });
 
+app.get('/api/tracker-test', async (_req, res) => {
+  const results = await Promise.all(TRACKERS.map(async tracker => {
+    const started = performance.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+      const url = new URL(tracker);
+      // Deliberately use an invalid/minimal announce request. Any HTTP response
+      // proves Render can reach the tracker; WebTorrent still handles real announces.
+      url.searchParams.set('info_hash', '00000000000000000000');
+      url.searchParams.set('peer_id', '-TS0001-' + '0'.repeat(12));
+      url.searchParams.set('port', '10000');
+      url.searchParams.set('uploaded', '0');
+      url.searchParams.set('downloaded', '0');
+      url.searchParams.set('left', '1');
+      url.searchParams.set('compact', '1');
+      const response = await fetch(url, {
+        signal: controller.signal,
+        headers: { 'user-agent': 'TorrentStudio-TrackerTest/1.0' }
+      });
+      const body = await response.text();
+      return {
+        tracker,
+        reachable: true,
+        status: response.status,
+        elapsedMs: elapsed(started),
+        body: body.slice(0, 300)
+      };
+    } catch (error) {
+      return {
+        tracker,
+        reachable: false,
+        elapsedMs: elapsed(started),
+        error: error?.message || String(error)
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }));
+
+  res.json({
+    ok: true,
+    testedAt: new Date().toISOString(),
+    results
+  });
+});
+
 app.get('/api/metadata-status', (_req, res) => {
   res.json({
     ok: true,
