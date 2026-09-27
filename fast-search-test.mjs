@@ -17,9 +17,7 @@ const APIBAY_URL = 'https://apibay.org/q.php';
 const TRACKERS = [
   'udp://tracker.opentrackr.org:1337/announce',
   'udp://open.stealth.si:80/announce',
-  'udp://tracker.torrent.eu.org:451/announce',
-  'udp://tracker.dler.org:6969/announce',
-  'udp://exodus.desync.com:6969/announce'
+  'udp://tracker.torrent.eu.org:451/announce'
 ];
 
 const client = new WebTorrent({
@@ -33,6 +31,15 @@ const client = new WebTorrent({
 
 const active = new Map();
 let metadataInFlight = false;
+let metadataDiagnostics = {
+  phase: 'idle',
+  infoHash: null,
+  peers: 0,
+  wires: 0,
+  warnings: 0,
+  startedAt: null,
+  elapsedMs: 0
+};
 
 client.on('error', err => {
   console.error('[WEBTORRENT] client error:', err?.message || err);
@@ -198,6 +205,15 @@ async function resolveMetadata(magnet, keepActive = true) {
 
   const started = performance.now();
   metadataInFlight = true;
+  metadataDiagnostics = {
+    phase: 'starting',
+    infoHash: null,
+    peers: 0,
+    wires: 0,
+    warnings: 0,
+    startedAt: new Date().toISOString(),
+    elapsedMs: 0
+  };
 
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -212,6 +228,8 @@ async function resolveMetadata(magnet, keepActive = true) {
         try { torrent.destroy({ destroyStore: true }); } catch {}
       }
       metadataInFlight = false;
+      metadataDiagnostics.phase = 'failed';
+      metadataDiagnostics.elapsedMs = elapsed(started);
       console.error('[METADATA]', {
         phase,
         elapsedMs: elapsed(started),
@@ -235,16 +253,24 @@ async function resolveMetadata(magnet, keepActive = true) {
 
       torrent.on('infoHash', () => {
         phase = 'discovering';
+        metadataDiagnostics.phase = phase;
+        metadataDiagnostics.infoHash = torrent.infoHash;
         console.log('[METADATA] infoHash discovered:', torrent.infoHash);
       });
       torrent.on('wire', wire => {
         phase = 'peer-connected';
+        metadataDiagnostics.phase = phase;
+        metadataDiagnostics.wires += 1;
+        metadataDiagnostics.peers = Number(torrent.numPeers || 0);
         console.log('[METADATA] peer connected; peers:', torrent.numPeers);
       });
 
       torrent.on('metadata', () => {
         if (settled) return;
         phase = 'metadata-received';
+        metadataDiagnostics.phase = phase;
+        metadataDiagnostics.peers = Number(torrent.numPeers || 0);
+        metadataDiagnostics.elapsedMs = elapsed(started);
         const elapsedMs = elapsed(started);
         try { torrent.pause(); } catch {}
         const metadata = metadataFromTorrent(torrent, elapsedMs, magnet);
@@ -273,6 +299,8 @@ async function resolveMetadata(magnet, keepActive = true) {
       torrent.on('error', fail);
       torrent.on('warning', error => {
         phase = 'warning';
+        metadataDiagnostics.phase = phase;
+        metadataDiagnostics.warnings += 1;
         console.warn('[TORRENT WARNING]', error?.message || error);
       });
     } catch (error) {
@@ -290,6 +318,7 @@ app.get('/health', (_req, res) => {
     webtorrent: '3.0.21',
     activeTorrents: active.size,
     metadataInFlight,
+    metadataDiagnostics,
     uptimeSeconds: Math.round(process.uptime())
   });
 });
@@ -327,6 +356,15 @@ app.post('/api/add', async (req, res) => {
     console.error('[ADD]', error);
     res.status(504).json({ ok: false, error: error?.message || 'Add failed' });
   }
+});
+
+app.get('/api/metadata-status', (_req, res) => {
+  res.json({
+    ok: true,
+    metadataInFlight,
+    ...metadataDiagnostics,
+    activeTorrents: active.size
+  });
 });
 
 app.get('/api/active', (_req, res) => {
