@@ -13,6 +13,7 @@ const METADATA_ATTEMPT_TIMEOUT_MS = Number(process.env.METADATA_ATTEMPT_TIMEOUT_
 const METADATA_MAX_RETRIES = Number(process.env.METADATA_MAX_RETRIES || 3);
 const METADATA_RETRY_DELAY_MS = Number(process.env.METADATA_RETRY_DELAY_MS || 150);
 const METADATA_MAX_CONNS = Number(process.env.METADATA_MAX_CONNS || 50);
+const METADATA_CACHE_TTL_MS = Number(process.env.METADATA_CACHE_TTL_MS || (24 * 60 * 60 * 1000));
 const APIBAY_ENABLED = process.env.ENABLE_APIBAY !== 'false';
 const TORRENTS_CSV_URL = 'https://torrents-csv.com/service/search';
 const APIBAY_URL = 'https://apibay.org/q.php';
@@ -547,7 +548,7 @@ async function resolveMetadataFromCache(normalizedMagnet, infoHash, keepActive) 
           active.delete(infoHash);
           void destroyTorrent(torrent).then(() => destroyMetadataClient(entry.client));
         }
-      }, 10 * 60 * 1000);
+      }, METADATA_CACHE_TTL_MS);
       cleanupTimer.unref?.();
       torrent = null;
       metadataClient = null;
@@ -861,7 +862,7 @@ app.get('/api/active', (_req, res) => {
 const server = app.listen(PORT, HOST, () => {
   console.log('[FAST TEST] listening on http://' + HOST + ':' + PORT);
   console.log('[FAST TEST] search sources: torrents-csv' + (APIBAY_ENABLED ? ', apibay' : ''));
-  console.log('[FAST TEST] WebTorrent HTTP-tracker metadata resolver ready; max connections:', METADATA_MAX_CONNS);
+  console.log('[FAST TEST] WebTorrent metadata resolver ready; max connections:', METADATA_MAX_CONNS, 'cache TTL ms:', METADATA_CACHE_TTL_MS);
 });
 
 async function shutdown() {
