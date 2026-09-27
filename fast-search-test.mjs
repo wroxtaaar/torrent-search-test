@@ -8,7 +8,10 @@ const HOST = '0.0.0.0';
 app.use(express.json({ limit: '256kb' }));
 
 const SEARCH_TIMEOUT_MS = Number(process.env.SEARCH_TIMEOUT_MS || 2500);
-const METADATA_TIMEOUT_MS = Number(process.env.METADATA_TIMEOUT_MS || 20000);
+const METADATA_TIMEOUT_MS = Number(process.env.METADATA_TIMEOUT_MS || 30000);
+const METADATA_ATTEMPT_TIMEOUT_MS = Number(process.env.METADATA_ATTEMPT_TIMEOUT_MS || 8000);
+const METADATA_MAX_RETRIES = Number(process.env.METADATA_MAX_RETRIES || 3);
+const METADATA_RETRY_DELAY_MS = Number(process.env.METADATA_RETRY_DELAY_MS || 150);
 const METADATA_MAX_CONNS = Number(process.env.METADATA_MAX_CONNS || 50);
 const APIBAY_ENABLED = process.env.ENABLE_APIBAY !== 'false';
 const TORRENTS_CSV_URL = 'https://torrents-csv.com/service/search';
@@ -18,6 +21,15 @@ const TRACKERS = [
   'http://tracker.dler.org:6969/announce',
   'http://tracker2.dler.org:80/announce',
   'http://1337.abcvg.info:80/announce'
+];
+
+const FALLBACK_TRACKERS = [
+  'http://tracker.qu.ax:6969/announce',
+  'http://tracker.renfei.net:8080/announce',
+  'http://t.overflow.biz:6969/announce',
+  'http://ipv4announce.sktorrent.eu:6969/announce',
+  'http://tracker.dhitechnical.com:6969/announce',
+  'http://tr.nyacat.pw:80/announce'
 ];
 
 const client = new WebTorrent({
@@ -30,6 +42,7 @@ const client = new WebTorrent({
 });
 
 const active = new Map();
+const metadataPromises = new Map();
 let metadataInFlight = false;
 let metadataDiagnostics = {
   phase: 'idle',
@@ -241,148 +254,254 @@ function metadataFromTorrent(torrent, elapsedMs, sourceMagnet) {
   };
 }
 
-async function resolveMetadata(magnet, keepActive = true) {
-  const normalizedMagnet = normalizeMagnet(magnet);
+function buildMagnetWithTrackers(normalizedMagnet, trackers) {
+  const url = new URL(normalizedMagnet);
+  const params = new URLSearchParams();
+  params.set('xt', url.searchParams.get('xt') || '');
+  const name = url.searchParams.get('dn') || '';
+  if (name) params.set('dn', name);
+  for (const tracker of trackers) params.append('tr', tracker);
+  return 'magnet:?' + params.toString().replace('xt=urn%3Abtih%3A', 'xt=urn:btih:');
+}
 
-  if (metadataInFlight) throw new Error('Another metadata request is already running. Please wait for it to finish.');
+function trackerPlan() {
+  const plans = [
+    [...TRACKERS],
+    [...FALLBACK_TRACKERS],
+    [...new Set([...TRACKERS, ...FALLBACK_TRACKERS])]
+  ];
+  return plans.slice(0, Math.max(1, Math.min(METADATA_MAX_RETRIES, plans.length)));
+}
 
-  const started = performance.now();
-  metadataInFlight = true;
-  metadataDiagnostics = {
-    phase: 'starting',
-    infoHash: null,
-    peers: 0,
-    wires: 0,
-    warnings: 0,
-    startedAt: new Date().toISOString(),
-    elapsedMs: 0
-  };
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function destroyTorrent(torrent) {
+  if (!torrent) return Promise.resolve();
+
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, 1500);
+
+    try {
+      torrent.destroy({ destroyStore: true }, finish);
+    } catch {
+      finish();
+    }
+  });
+}
+
+async function resolveMetadataAttempt(normalizedMagnet, trackers, attempt, keepActive, overallStarted, infoHash) {
+  const attemptStarted = performance.now();
+  const attemptMagnet = buildMagnetWithTrackers(normalizedMagnet, trackers);
 
   return new Promise((resolve, reject) => {
     let settled = false;
     let torrent;
-    let phase = 'starting';
 
-    const fail = error => {
+    metadataDiagnostics.attempt = attempt;
+    metadataDiagnostics.maxAttempts = trackerPlan().length;
+    metadataDiagnostics.trackers = trackers.length;
+
+    const fail = async error => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
-      if (torrent) {
-        try { torrent.destroy({ destroyStore: true }); } catch {}
-      }
-      metadataInFlight = false;
-      metadataDiagnostics.phase = 'failed';
-      metadataDiagnostics.elapsedMs = elapsed(started);
-      console.error('[METADATA]', {
-        phase,
+
+      const elapsedMs = elapsed(attemptStarted);
+      metadataDiagnostics.phase = 'attempt-failed';
+      metadataDiagnostics.elapsedMs = elapsed(overallStarted);
+      metadataDiagnostics.attemptElapsedMs = elapsedMs;
+
+      console.warn('[METADATA] attempt failed', {
+        attempt,
+        trackers: trackers.length,
         infoHash: metadataDiagnostics.infoHash,
         peers: metadataDiagnostics.peers,
         wires: metadataDiagnostics.wires,
-        elapsedMs: elapsed(started),
+        elapsedMs,
         error: error?.message || String(error)
       });
+
+      await destroyTorrent(torrent);
       reject(error);
     };
 
-    const timeout = setTimeout(() => fail(new Error('Metadata resolution timed out after ' + METADATA_TIMEOUT_MS + 'ms')), METADATA_TIMEOUT_MS);
+    const timeout = setTimeout(() => {
+      void fail(new Error('Metadata attempt timed out after ' + METADATA_ATTEMPT_TIMEOUT_MS + 'ms'));
+    }, METADATA_ATTEMPT_TIMEOUT_MS);
     timeout.unref?.();
 
     try {
-      phase = 'adding';
-      torrent = client.add(normalizedMagnet, {
-        // Metadata discovery requires active peer connections. Do not pause
-        // the torrent before peers can be found; deselect all payload pieces
-        // so that receiving metadata cannot start a content download.
+      torrent = client.add(attemptMagnet, {
         paused: false,
         deselect: true,
         dht: false,
-        // Use the known-good HTTP trackers for peer discovery on Render.
-        // DHT remains enabled as a second discovery path.
         tracker: true,
         maxConns: METADATA_MAX_CONNS,
-        path: '/tmp/torrent-studio-metadata'
-      });
-
-      // Instrument WebTorrent's tracker lifecycle so we can distinguish
-      // tracker discovery from peer connection failures.
-      torrent.on('trackerAnnounce', tracker => {
-        console.log('[TRACKER] announce:', tracker?.url || tracker);
-      });
-      torrent.on('trackerWarning', (error, tracker) => {
-        console.warn('[TRACKER] warning:', tracker?.url || tracker, error?.message || error);
-      });
-      torrent.on('trackerError', (error, tracker) => {
-        console.error('[TRACKER] error:', tracker?.url || tracker, error?.message || error);
-      });
-      torrent.on('trackerUpdate', (data, tracker) => {
-        console.log('[TRACKER] update:', {
-          tracker: tracker?.url || tracker,
-          complete: data?.complete,
-          incomplete: data?.incomplete,
-          peers: Array.isArray(data?.peers) ? data.peers.length : null
-        });
-      });
-      torrent.on('peer', peer => {
-        console.log('[TRACKER] peer discovered:', peer?.id || peer);
+        path: '/tmp/torrent-studio-metadata/' + infoHash
       });
 
       torrent.on('infoHash', () => {
-        phase = 'discovering';
-        metadataDiagnostics.phase = phase;
+        metadataDiagnostics.phase = 'discovering';
         metadataDiagnostics.infoHash = torrent.infoHash;
         console.log('[METADATA] infoHash discovered:', torrent.infoHash);
       });
 
-      torrent.on('wire', wire => {
-        phase = 'peer-connected';
-        metadataDiagnostics.phase = phase;
+      torrent.on('wire', () => {
+        metadataDiagnostics.phase = 'peer-connected';
         metadataDiagnostics.wires += 1;
         metadataDiagnostics.peers = Number(torrent.numPeers || 0);
         console.log('[METADATA] peer connected; peers:', torrent.numPeers);
       });
 
+      torrent.on('peer', peer => {
+        console.log('[TRACKER] peer discovered:', peer?.id || peer);
+      });
+
+      torrent.on('noPeers', announceType => {
+        metadataDiagnostics.phase = 'no-peers';
+        console.log('[METADATA] no peers after announce:', announceType);
+      });
+
       torrent.on('metadata', () => {
         if (settled) return;
-        phase = 'metadata-received';
-        metadataDiagnostics.phase = phase;
-        metadataDiagnostics.peers = Number(torrent.numPeers || 0);
-        metadataDiagnostics.elapsedMs = elapsed(started);
-        const elapsedMs = elapsed(started);
-        try { torrent.pause(); } catch {}
-        const metadata = metadataFromTorrent(torrent, elapsedMs, normalizedMagnet);
+        settled = true;
         clearTimeout(timeout);
+
+        const elapsedMs = elapsed(overallStarted);
+        metadataDiagnostics.phase = 'metadata-received';
+        metadataDiagnostics.peers = Number(torrent.numPeers || 0);
+        metadataDiagnostics.elapsedMs = elapsedMs;
+        metadataDiagnostics.attemptElapsedMs = elapsed(attemptStarted);
+
+        try { torrent.pause(); } catch {}
+
+        const metadata = {
+          ...metadataFromTorrent(torrent, elapsedMs, attemptMagnet),
+          attempts: attempt,
+          trackerCount: trackers.length
+        };
 
         if (keepActive) {
           const id = torrent.infoHash;
           active.set(id, { torrent, createdAt: Date.now(), metadata });
+
           const cleanup = setTimeout(() => {
             const entry = active.get(id);
             if (entry?.torrent === torrent) {
               active.delete(id);
-              try { client.remove(torrent, { destroyStore: true }); } catch {}
+              void destroyTorrent(torrent);
             }
           }, 10 * 60 * 1000);
           cleanup.unref?.();
         } else {
-          try { client.remove(torrent, { destroyStore: true }); } catch {}
+          void destroyTorrent(torrent);
         }
 
-        settled = true;
-        metadataInFlight = false;
         resolve(metadata);
       });
 
-      torrent.on('error', fail);
+      torrent.on('error', error => {
+        void fail(error);
+      });
+
       torrent.on('warning', error => {
-        phase = 'warning';
-        metadataDiagnostics.phase = phase;
         metadataDiagnostics.warnings += 1;
         console.warn('[TORRENT WARNING]', error?.message || error);
       });
     } catch (error) {
-      fail(error);
+      void fail(error);
     }
   });
+}
+
+async function resolveMetadataFresh(normalizedMagnet, infoHash, keepActive) {
+  const started = performance.now();
+  const plans = trackerPlan();
+  let lastError = null;
+
+  metadataDiagnostics = {
+    phase: 'starting',
+    infoHash,
+    peers: 0,
+    wires: 0,
+    warnings: 0,
+    attempt: 0,
+    maxAttempts: plans.length,
+    trackers: 0,
+    startedAt: new Date().toISOString(),
+    elapsedMs: 0
+  };
+
+  for (let i = 0; i < plans.length; i += 1) {
+    try {
+      return await resolveMetadataAttempt(
+        normalizedMagnet,
+        plans[i],
+        i + 1,
+        keepActive,
+        started,
+        infoHash
+      );
+    } catch (error) {
+      lastError = error;
+      if (i + 1 < plans.length) {
+        metadataDiagnostics.phase = 'retrying';
+        metadataDiagnostics.elapsedMs = elapsed(started);
+        console.warn('[METADATA] retrying with tracker fallback', {
+          nextAttempt: i + 2,
+          elapsedMs: elapsed(started)
+        });
+        if (METADATA_RETRY_DELAY_MS > 0) await sleep(METADATA_RETRY_DELAY_MS);
+      }
+    }
+  }
+
+  metadataDiagnostics.phase = 'failed';
+  metadataDiagnostics.elapsedMs = elapsed(started);
+  throw new Error(
+    'Metadata resolution failed after ' + plans.length +
+    ' attempts (' + metadataDiagnostics.elapsedMs + 'ms): ' +
+    (lastError?.message || 'no metadata received')
+  );
+}
+
+async function resolveMetadata(magnet, keepActive = true) {
+  const normalizedMagnet = normalizeMagnet(magnet);
+  const url = new URL(normalizedMagnet);
+  const infoHash = (url.searchParams.get('xt') || '')
+    .replace(/^urn:btih:/i, '')
+    .toLowerCase();
+
+  const cached = active.get(infoHash);
+  if (cached?.metadata) {
+    console.log('[METADATA] cache hit:', infoHash);
+    return cached.metadata;
+  }
+
+  const existing = metadataPromises.get(infoHash);
+  if (existing) {
+    console.log('[METADATA] joining duplicate request:', infoHash);
+    return existing;
+  }
+
+  const promise = resolveMetadataFresh(normalizedMagnet, infoHash, keepActive)
+    .finally(() => {
+      metadataPromises.delete(infoHash);
+      metadataInFlight = metadataPromises.size > 0;
+    });
+
+  metadataPromises.set(infoHash, promise);
+  metadataInFlight = true;
+  return promise;
 }
 
 app.get('/', (_req, res) => res.sendFile(process.cwd() + '/fast-search-test.html'));
@@ -393,7 +512,7 @@ app.get('/health', (_req, res) => {
     service: 'torrent-studio-fast-search-test',
     webtorrent: '3.0.21',
     activeTorrents: active.size,
-    metadataInFlight,
+    metadataInFlight: metadataPromises.size > 0,
     metadataDiagnostics,
     uptimeSeconds: Math.round(process.uptime())
   });
@@ -484,7 +603,7 @@ app.get('/api/tracker-test', async (_req, res) => {
 app.get('/api/metadata-status', (_req, res) => {
   res.json({
     ok: true,
-    metadataInFlight,
+    metadataInFlight: metadataPromises.size > 0,
     ...metadataDiagnostics,
     activeTorrents: active.size
   });
