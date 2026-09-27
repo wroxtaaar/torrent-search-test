@@ -9,7 +9,7 @@ app.use(express.json({ limit: '256kb' }));
 
 const SEARCH_TIMEOUT_MS = Number(process.env.SEARCH_TIMEOUT_MS || 2500);
 const METADATA_TIMEOUT_MS = Number(process.env.METADATA_TIMEOUT_MS || 20000);
-const METADATA_MAX_CONNS = Number(process.env.METADATA_MAX_CONNS || 10);
+const METADATA_MAX_CONNS = Number(process.env.METADATA_MAX_CONNS || 50);
 const APIBAY_ENABLED = process.env.ENABLE_APIBAY !== 'false';
 const TORRENTS_CSV_URL = 'https://torrents-csv.com/service/search';
 const APIBAY_URL = 'https://apibay.org/q.php';
@@ -21,7 +21,7 @@ const TRACKERS = [
 ];
 
 const client = new WebTorrent({
-  dht: true,
+  dht: false,
   tracker: true,
   lsd: false,
   natUpnp: false,
@@ -295,8 +295,8 @@ async function resolveMetadata(magnet, keepActive = true) {
         // so that receiving metadata cannot start a content download.
         paused: false,
         deselect: true,
-        dht: true,
-        // Allow only the controlled trackers embedded by normalizeMagnet().
+        dht: false,
+        // Use the known-good HTTP trackers for peer discovery on Render.
         // DHT remains enabled as a second discovery path.
         tracker: true,
         maxConns: METADATA_MAX_CONNS,
@@ -497,7 +497,7 @@ app.get('/api/active', (_req, res) => {
 const server = app.listen(PORT, HOST, () => {
   console.log('[FAST TEST] listening on http://' + HOST + ':' + PORT);
   console.log('[FAST TEST] search sources: torrents-csv' + (APIBAY_ENABLED ? ', apibay' : ''));
-  console.log('[FAST TEST] WebTorrent DHT-only metadata resolver ready');
+  console.log('[FAST TEST] WebTorrent HTTP-tracker metadata resolver ready; max connections:', METADATA_MAX_CONNS);
 });
 
 function shutdown() {
