@@ -14,6 +14,8 @@ const METADATA_MAX_RETRIES = Number(process.env.METADATA_MAX_RETRIES || 3);
 const METADATA_RETRY_DELAY_MS = Number(process.env.METADATA_RETRY_DELAY_MS || 150);
 const METADATA_MAX_CONNS = Number(process.env.METADATA_MAX_CONNS || 50);
 const METADATA_CACHE_TTL_MS = Number(process.env.METADATA_CACHE_TTL_MS || (24 * 60 * 60 * 1000));
+const METADATA_BACKGROUND_TTL_MS = Number(process.env.METADATA_BACKGROUND_TTL_MS || (6 * 60 * 60 * 1000));
+const METADATA_BACKGROUND_ROUND_DELAY_MS = Number(process.env.METADATA_BACKGROUND_ROUND_DELAY_MS || 30000);
 const APIBAY_ENABLED = process.env.ENABLE_APIBAY !== 'false';
 const TORRENTS_CSV_URL = 'https://torrents-csv.com/service/search';
 const APIBAY_URL = 'https://apibay.org/q.php';
@@ -36,6 +38,8 @@ const FALLBACK_TRACKERS = [
 const active = new Map();
 const metadataClients = new Set();
 const metadataPromises = new Map();
+const metadataJobs = new Map();
+const metadataJobsByHash = new Map();
 let metadataInFlight = false;
 let metadataDiagnostics = {
   phase: 'idle',
@@ -609,7 +613,7 @@ async function resolveMetadataFresh(normalizedMagnet, infoHash, keepActive) {
       }));
     };
 
-    const finishSuccess = async ({ torrent, metadata, attempt }) => {
+    const finishSuccess = async ({ torrent, metadata, attempt, client }) => {
       if (finished) return;
       finished = true;
 
@@ -620,7 +624,7 @@ async function resolveMetadataFresh(normalizedMagnet, infoHash, keepActive) {
       metadataDiagnostics.attempt = attempt;
 
       if (keepActive) {
-        active.set(infoHash, { torrent, client: metadataClient, createdAt: Date.now(), metadata });
+        active.set(infoHash, { torrent, client, createdAt: Date.now(), metadata });
 
         const cleanupTimer = setTimeout(() => {
           const entry = active.get(infoHash);
@@ -628,7 +632,7 @@ async function resolveMetadataFresh(normalizedMagnet, infoHash, keepActive) {
             active.delete(infoHash);
             void destroyTorrent(torrent).then(() => destroyMetadataClient(entry.client));
           }
-        }, 10 * 60 * 1000);
+        }, METADATA_CACHE_TTL_MS);
         cleanupTimer.unref?.();
       }
 
@@ -700,6 +704,115 @@ async function resolveMetadataFresh(normalizedMagnet, infoHash, keepActive) {
   });
 }
 
+function publicMetadataJob(job) {
+  return {
+    jobId: job.jobId,
+    infoHash: job.infoHash,
+    name: job.name,
+    status: job.status,
+    createdAt: job.createdAt,
+    startedAt: job.startedAt,
+    updatedAt: job.updatedAt,
+    elapsedMs: Math.max(0, Math.round((job.finishedAt || Date.now()) - job.startedAt)),
+    deadlineAt: job.deadlineAt,
+    rounds: job.rounds,
+    error: job.error || null,
+    metadata: job.metadata || null
+  };
+}
+
+function makeMetadataJobId() {
+  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+}
+
+async function runBackgroundMetadataJob(job) {
+  const started = Date.now();
+  job.startedAt = started;
+  job.updatedAt = started;
+
+  try {
+    // Try the shared HTTP .torrent cache first. This is deliberately inside
+    // the background job so the HTTP request can return immediately.
+    const cachedMetadata = await resolveMetadataFromCache(job.normalizedMagnet, job.infoHash, true);
+    if (cachedMetadata) {
+      job.status = 'completed';
+      job.metadata = cachedMetadata;
+      job.updatedAt = Date.now();
+      job.finishedAt = job.updatedAt;
+      return;
+    }
+
+    while (Date.now() < job.deadlineAt && job.status === 'resolving') {
+      job.rounds += 1;
+      job.updatedAt = Date.now();
+
+      try {
+        const metadata = await resolveMetadataFresh(job.normalizedMagnet, job.infoHash, true);
+        job.status = 'completed';
+        job.metadata = metadata;
+        job.updatedAt = Date.now();
+        job.finishedAt = job.updatedAt;
+        return;
+      } catch (error) {
+        job.lastError = error?.message || String(error);
+        job.updatedAt = Date.now();
+        console.warn('[METADATA JOB] round failed', {
+          jobId: job.jobId,
+          infoHash: job.infoHash,
+          round: job.rounds,
+          elapsedMs: Date.now() - started,
+          error: job.lastError
+        });
+      }
+
+      const remaining = job.deadlineAt - Date.now();
+      if (remaining <= 0) break;
+      await sleep(Math.min(METADATA_BACKGROUND_ROUND_DELAY_MS, remaining));
+    }
+
+    job.status = 'failed';
+    job.error = 'Metadata could not be resolved within the 6-hour background window';
+    job.updatedAt = Date.now();
+    job.finishedAt = job.updatedAt;
+  } catch (error) {
+    job.status = 'failed';
+    job.error = error?.message || String(error);
+    job.updatedAt = Date.now();
+    job.finishedAt = job.updatedAt;
+  } finally {
+    metadataJobsByHash.delete(job.infoHash);
+    setTimeout(() => metadataJobs.delete(job.jobId), 60 * 60 * 1000).unref?.();
+  }
+}
+
+function startMetadataBackgroundJob(normalizedMagnet, infoHash, name) {
+  const existing = metadataJobsByHash.get(infoHash);
+  if (existing) return existing;
+
+  const now = Date.now();
+  const job = {
+    jobId: makeMetadataJobId(),
+    infoHash,
+    name,
+    normalizedMagnet,
+    status: 'resolving',
+    createdAt: now,
+    startedAt: null,
+    updatedAt: now,
+    finishedAt: null,
+    deadlineAt: now + METADATA_BACKGROUND_TTL_MS,
+    rounds: 0,
+    lastError: null,
+    error: null,
+    metadata: null
+  };
+
+  metadataJobs.set(job.jobId, job);
+  metadataJobsByHash.set(infoHash, job);
+  void runBackgroundMetadataJob(job);
+  return job;
+}
+
 async function resolveMetadata(magnet, keepActive = true) {
   const normalizedMagnet = normalizeMagnet(magnet);
   const url = new URL(normalizedMagnet);
@@ -765,12 +878,45 @@ app.get('/api/search', async (req, res) => {
 app.post('/api/metadata', async (req, res) => {
   const magnet = String(req.body?.magnet || '').trim();
   if (!magnet) return res.status(400).json({ error: 'magnet is required' });
+
   try {
-    res.json({ ok: true, ...(await resolveMetadata(magnet, true)) });
+    const normalizedMagnet = normalizeMagnet(magnet);
+    const url = new URL(normalizedMagnet);
+    const infoHash = (url.searchParams.get('xt') || '').replace(/^urn:btih:/i, '').toLowerCase();
+    const name = url.searchParams.get('dn') || '';
+
+    const cached = active.get(infoHash);
+    if (cached?.metadata) {
+      return res.json({ ok: true, status: 'completed', ...cached.metadata });
+    }
+
+    const existing = metadataJobsByHash.get(infoHash);
+    const job = existing || startMetadataBackgroundJob(normalizedMagnet, infoHash, name);
+
+    res.status(202).json({
+      ok: true,
+      status: job.status,
+      jobId: job.jobId,
+      infoHash: job.infoHash,
+      name: job.name
+    });
   } catch (error) {
     console.error('[METADATA]', error);
-    res.status(504).json({ ok: false, error: error?.message || 'Metadata resolution failed' });
+    res.status(400).json({ ok: false, error: error?.message || 'Metadata request failed' });
   }
+});
+
+app.get('/api/metadata-jobs', (_req, res) => {
+  res.json({
+    ok: true,
+    jobs: [...metadataJobs.values()].map(publicMetadataJob)
+  });
+});
+
+app.get('/api/metadata-jobs/:jobId', (req, res) => {
+  const job = metadataJobs.get(String(req.params.jobId));
+  if (!job) return res.status(404).json({ ok: false, error: 'Metadata job not found' });
+  res.json({ ok: true, job: publicMetadataJob(job) });
 });
 
 app.post('/api/add', (req, res) => {
@@ -850,6 +996,7 @@ app.get('/api/metadata-status', (_req, res) => {
   res.json({
     ok: true,
     metadataInFlight: metadataPromises.size > 0,
+    backgroundMetadataJobs: metadataJobs.size,
     ...metadataDiagnostics,
     activeTorrents: active.size
   });
