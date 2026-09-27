@@ -8,6 +8,8 @@ const HOST = '0.0.0.0';
 app.use(express.json({ limit: '256kb' }));
 
 const SEARCH_TIMEOUT_MS = Number(process.env.SEARCH_TIMEOUT_MS || 2500);
+const METADATA_TIMEOUT_MS = Number(process.env.METADATA_TIMEOUT_MS || 20000);
+const METADATA_MAX_CONNS = Number(process.env.METADATA_MAX_CONNS || 10);
 const APIBAY_ENABLED = process.env.ENABLE_APIBAY !== 'false';
 const TORRENTS_CSV_URL = 'https://torrents-csv.com/service/search';
 const APIBAY_URL = 'https://apibay.org/q.php';
@@ -26,10 +28,11 @@ const client = new WebTorrent({
   lsd: false,
   natUpnp: false,
   natPmp: false,
-  maxConns: 35
+  maxConns: METADATA_MAX_CONNS
 });
 
 const active = new Map();
+let metadataInFlight = false;
 
 client.on('error', err => {
   console.error('[WEBTORRENT] client error:', err?.message || err);
@@ -191,12 +194,15 @@ function metadataFromTorrent(torrent, elapsedMs, sourceMagnet) {
 
 async function resolveMetadata(magnet, keepActive = true) {
   if (!/^magnet:\?/i.test(magnet)) throw new Error('A valid magnet URI is required');
+  if (metadataInFlight) throw new Error('Another metadata request is already running. Please wait for it to finish.');
 
   const started = performance.now();
+  metadataInFlight = true;
 
   return new Promise((resolve, reject) => {
     let settled = false;
     let torrent;
+    let phase = 'starting';
 
     const fail = error => {
       if (settled) return;
@@ -205,23 +211,40 @@ async function resolveMetadata(magnet, keepActive = true) {
       if (torrent) {
         try { torrent.destroy({ destroyStore: true }); } catch {}
       }
+      metadataInFlight = false;
+      console.error('[METADATA]', {
+        phase,
+        elapsedMs: elapsed(started),
+        error: error?.message || String(error)
+      });
       reject(error);
     };
 
-    const timeout = setTimeout(() => fail(new Error('Metadata resolution timed out')), 45000);
+    const timeout = setTimeout(() => fail(new Error('Metadata resolution timed out after ' + METADATA_TIMEOUT_MS + 'ms')), METADATA_TIMEOUT_MS);
     timeout.unref?.();
 
     try {
+      phase = 'adding';
       torrent = client.add(magnet, {
         paused: true,
         dht: true,
         tracker: true,
-        maxConns: 35,
+        maxConns: METADATA_MAX_CONNS,
         path: '/tmp/torrent-studio-metadata'
+      });
+
+      torrent.on('infoHash', () => {
+        phase = 'discovering';
+        console.log('[METADATA] infoHash discovered:', torrent.infoHash);
+      });
+      torrent.on('wire', wire => {
+        phase = 'peer-connected';
+        console.log('[METADATA] peer connected; peers:', torrent.numPeers);
       });
 
       torrent.on('metadata', () => {
         if (settled) return;
+        phase = 'metadata-received';
         const elapsedMs = elapsed(started);
         try { torrent.pause(); } catch {}
         const metadata = metadataFromTorrent(torrent, elapsedMs, magnet);
@@ -243,11 +266,15 @@ async function resolveMetadata(magnet, keepActive = true) {
         }
 
         settled = true;
+        metadataInFlight = false;
         resolve(metadata);
       });
 
       torrent.on('error', fail);
-      torrent.on('warning', error => console.warn('[TORRENT WARNING]', error?.message || error));
+      torrent.on('warning', error => {
+        phase = 'warning';
+        console.warn('[TORRENT WARNING]', error?.message || error);
+      });
     } catch (error) {
       fail(error);
     }
