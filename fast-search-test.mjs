@@ -8,7 +8,7 @@ const HOST = '0.0.0.0';
 app.use(express.json({ limit: '256kb' }));
 
 const SEARCH_TIMEOUT_MS = Number(process.env.SEARCH_TIMEOUT_MS || 2500);
-const METADATA_TIMEOUT_MS = Number(process.env.METADATA_TIMEOUT_MS || 30000);
+const METADATA_TIMEOUT_MS = Number(process.env.METADATA_TIMEOUT_MS || 15000);
 const METADATA_ATTEMPT_TIMEOUT_MS = Number(process.env.METADATA_ATTEMPT_TIMEOUT_MS || 8000);
 const METADATA_MAX_RETRIES = Number(process.env.METADATA_MAX_RETRIES || 3);
 const METADATA_RETRY_DELAY_MS = Number(process.env.METADATA_RETRY_DELAY_MS || 150);
@@ -264,13 +264,12 @@ function buildMagnetWithTrackers(normalizedMagnet, trackers) {
   return 'magnet:?' + params.toString().replace('xt=urn%3Abtih%3A', 'xt=urn:btih:');
 }
 
-function trackerPlan() {
-  const plans = [
-    [...TRACKERS],
-    [...FALLBACK_TRACKERS],
-    [...new Set([...TRACKERS, ...FALLBACK_TRACKERS])]
+function metadataPlans() {
+  return [
+    { delayMs: 0, trackers: [...TRACKERS], maxConns: METADATA_MAX_CONNS },
+    { delayMs: 3000, trackers: [...FALLBACK_TRACKERS], maxConns: 25 },
+    { delayMs: 7000, trackers: [...new Set([...TRACKERS, ...FALLBACK_TRACKERS])], maxConns: 25 }
   ];
-  return plans.slice(0, Math.max(1, Math.min(METADATA_MAX_RETRIES, plans.length)));
 }
 
 function sleep(ms) {
@@ -298,45 +297,42 @@ function destroyTorrent(torrent) {
   });
 }
 
-async function resolveMetadataAttempt(normalizedMagnet, trackers, attempt, attemptTimeoutMs, keepActive, overallStarted, infoHash) {
+function startMetadataAttempt(normalizedMagnet, plan, attempt, keepActive, overallStarted, infoHash, onMetadata) {
   const attemptStarted = performance.now();
-  const attemptMagnet = buildMagnetWithTrackers(normalizedMagnet, trackers);
+  const attemptMagnet = buildMagnetWithTrackers(normalizedMagnet, plan.trackers);
 
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let torrent;
+  let torrent = null;
+  let settled = false;
+  let timeout;
 
-    metadataDiagnostics.attempt = attempt;
-    metadataDiagnostics.maxAttempts = trackerPlan().length;
-    metadataDiagnostics.trackers = trackers.length;
+  const cleanup = async () => {
+    clearTimeout(timeout);
+    await destroyTorrent(torrent);
+  };
 
+  const promise = new Promise((resolve, reject) => {
     const fail = async error => {
       if (settled) return;
       settled = true;
-      clearTimeout(timeout);
 
       const elapsedMs = elapsed(attemptStarted);
-      metadataDiagnostics.phase = 'attempt-failed';
-      metadataDiagnostics.elapsedMs = elapsed(overallStarted);
-      metadataDiagnostics.attemptElapsedMs = elapsedMs;
-
       console.warn('[METADATA] attempt failed', {
         attempt,
-        trackers: trackers.length,
-        infoHash: metadataDiagnostics.infoHash,
-        peers: metadataDiagnostics.peers,
-        wires: metadataDiagnostics.wires,
+        trackers: plan.trackers.length,
+        infoHash,
+        peers: Number(torrent?.numPeers || 0),
+        wires: Number(torrent?._peers?.length || 0),
         elapsedMs,
         error: error?.message || String(error)
       });
 
-      await destroyTorrent(torrent);
+      await cleanup();
       reject(error);
     };
 
-    const timeout = setTimeout(() => {
-      void fail(new Error('Metadata attempt timed out after ' + attemptTimeoutMs + 'ms'));
-    }, attemptTimeoutMs);
+    timeout = setTimeout(() => {
+      void fail(new Error('Metadata attempt timed out after ' + Math.round((METADATA_ATTEMPT_TIMEOUT_MS / 1000)) + 's'));
+    }, METADATA_ATTEMPT_TIMEOUT_MS);
     timeout.unref?.();
 
     try {
@@ -345,93 +341,86 @@ async function resolveMetadataAttempt(normalizedMagnet, trackers, attempt, attem
         deselect: true,
         dht: false,
         tracker: true,
-        maxConns: METADATA_MAX_CONNS,
-        path: '/tmp/torrent-studio-metadata/' + infoHash
+        maxConns: plan.maxConns,
+        path: '/tmp/torrent-studio-metadata/' + infoHash + '-' + attempt
+      });
+
+      console.log('[METADATA] attempt started', {
+        attempt,
+        delayMs: plan.delayMs,
+        trackers: plan.trackers.length,
+        maxConns: plan.maxConns,
+        infoHash
       });
 
       torrent.on('infoHash', () => {
-        metadataDiagnostics.phase = 'discovering';
-        metadataDiagnostics.infoHash = torrent.infoHash;
-        console.log('[METADATA] infoHash discovered:', torrent.infoHash);
+        console.log('[METADATA] infoHash discovered:', torrent.infoHash, 'attempt:', attempt);
       });
 
       torrent.on('wire', () => {
-        metadataDiagnostics.phase = 'peer-connected';
-        metadataDiagnostics.wires += 1;
-        metadataDiagnostics.peers = Number(torrent.numPeers || 0);
-        console.log('[METADATA] peer connected; peers:', torrent.numPeers);
+        console.log('[METADATA] peer connected; peers:', torrent.numPeers, 'attempt:', attempt);
       });
 
       let discoveredPeers = 0;
       torrent.on('peer', peer => {
         discoveredPeers += 1;
-        metadataDiagnostics.discoveredPeers = discoveredPeers;
         if (discoveredPeers <= 3 || discoveredPeers % 10 === 0) {
-          console.log('[TRACKER] peer discovered:', discoveredPeers, peer?.id || peer);
+          console.log('[TRACKER] peer discovered:', discoveredPeers, peer?.id || peer, 'attempt:', attempt);
         }
       });
 
       torrent.on('noPeers', announceType => {
-        metadataDiagnostics.phase = 'no-peers';
-        console.log('[METADATA] no peers after announce:', announceType);
+        console.log('[METADATA] no peers after announce:', announceType, 'attempt:', attempt);
       });
 
-      torrent.on('metadata', () => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeout);
-
-        const elapsedMs = elapsed(overallStarted);
-        metadataDiagnostics.phase = 'metadata-received';
-        metadataDiagnostics.peers = Number(torrent.numPeers || 0);
-        metadataDiagnostics.elapsedMs = elapsedMs;
-        metadataDiagnostics.attemptElapsedMs = elapsed(attemptStarted);
-
-        try { torrent.pause(); } catch {}
-
-        const metadata = {
-          ...metadataFromTorrent(torrent, elapsedMs, attemptMagnet),
-          attempts: attempt,
-          trackerCount: trackers.length
-        };
-
-        if (keepActive) {
-          const id = torrent.infoHash;
-          active.set(id, { torrent, createdAt: Date.now(), metadata });
-
-          const cleanup = setTimeout(() => {
-            const entry = active.get(id);
-            if (entry?.torrent === torrent) {
-              active.delete(id);
-              void destroyTorrent(torrent);
-            }
-          }, 10 * 60 * 1000);
-          cleanup.unref?.();
-        } else {
-          void destroyTorrent(torrent);
-        }
-
-        resolve(metadata);
+      torrent.on('warning', error => {
+        console.warn('[TORRENT WARNING] attempt', attempt, error?.message || error);
       });
 
       torrent.on('error', error => {
         void fail(error);
       });
 
-      torrent.on('warning', error => {
-        metadataDiagnostics.warnings += 1;
-        console.warn('[TORRENT WARNING]', error?.message || error);
+      torrent.on('metadata', async () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+
+        const attemptElapsedMs = elapsed(attemptStarted);
+        const totalElapsedMs = elapsed(overallStarted);
+        const metadata = {
+          ...metadataFromTorrent(torrent, totalElapsedMs, attemptMagnet),
+          attempts: attempt,
+          trackerCount: plan.trackers.length,
+          attemptElapsedMs
+        };
+
+        console.log('[METADATA] metadata received', {
+          attempt,
+          attemptElapsedMs,
+          totalElapsedMs,
+          peers: Number(torrent.numPeers || 0)
+        });
+
+        try { torrent.pause(); } catch {}
+        onMetadata({ torrent, metadata, attempt, attemptElapsedMs });
+        resolve({ torrent, metadata, attempt });
       });
     } catch (error) {
       void fail(error);
     }
   });
+
+  return {
+    promise,
+    getTorrent: () => torrent,
+    cleanup
+  };
 }
 
 async function resolveMetadataFresh(normalizedMagnet, infoHash, keepActive) {
   const started = performance.now();
-  const plans = trackerPlan();
-  let lastError = null;
+  const plans = metadataPlans();
 
   metadataDiagnostics = {
     phase: 'starting',
@@ -442,54 +431,124 @@ async function resolveMetadataFresh(normalizedMagnet, infoHash, keepActive) {
     warnings: 0,
     attempt: 0,
     maxAttempts: plans.length,
-    trackers: 0,
+    trackers: plans[0].trackers.length,
     startedAt: new Date().toISOString(),
     elapsedMs: 0
   };
 
-  for (let i = 0; i < plans.length; i += 1) {
-    const remainingMs = METADATA_TIMEOUT_MS - elapsed(started);
-    if (remainingMs <= 0) break;
+  return new Promise((resolve, reject) => {
+    let finished = false;
+    let completed = 0;
+    const attempts = [];
+    const startTimers = [];
+    const overallTimer = setTimeout(() => {
+      finishFailure(new Error('Metadata resolution timed out after ' + METADATA_TIMEOUT_MS + 'ms'));
+    }, METADATA_TIMEOUT_MS);
+    overallTimer.unref?.();
 
-    const attemptTimeoutMs = Math.min(METADATA_ATTEMPT_TIMEOUT_MS, remainingMs);
+    const finishCleanup = async winnerTorrent => {
+      clearTimeout(overallTimer);
+      for (const timer of startTimers) clearTimeout(timer);
 
-    try {
-      return await resolveMetadataAttempt(
-        normalizedMagnet,
-        plans[i],
-        i + 1,
-        attemptTimeoutMs,
-        keepActive,
-        started,
-        infoHash
-      );
-    } catch (error) {
-      lastError = error;
-      if (i + 1 < plans.length) {
-        const afterAttemptMs = elapsed(started);
-        if (afterAttemptMs >= METADATA_TIMEOUT_MS) break;
-
-        metadataDiagnostics.phase = 'retrying';
-        metadataDiagnostics.elapsedMs = afterAttemptMs;
-        console.warn('[METADATA] retrying with tracker fallback', {
-          nextAttempt: i + 2,
-          elapsedMs: afterAttemptMs,
-          remainingMs: METADATA_TIMEOUT_MS - afterAttemptMs
-        });
-        if (METADATA_RETRY_DELAY_MS > 0) {
-          await sleep(Math.min(METADATA_RETRY_DELAY_MS, METADATA_TIMEOUT_MS - afterAttemptMs));
+      await Promise.all(attempts.map(async attempt => {
+        const torrent = attempt.getTorrent();
+        if (torrent && torrent !== winnerTorrent) {
+          await attempt.cleanup();
         }
-      }
-    }
-  }
+      }));
+    };
 
-  metadataDiagnostics.phase = 'failed';
-  metadataDiagnostics.elapsedMs = elapsed(started);
-  throw new Error(
-    'Metadata resolution failed after ' + plans.length +
-    ' attempts (' + metadataDiagnostics.elapsedMs + 'ms): ' +
-    (lastError?.message || 'no metadata received')
-  );
+    const finishSuccess = async ({ torrent, metadata, attempt }) => {
+      if (finished) return;
+      finished = true;
+
+      metadataDiagnostics.phase = 'metadata-received';
+      metadataDiagnostics.infoHash = infoHash;
+      metadataDiagnostics.peers = Number(torrent.numPeers || 0);
+      metadataDiagnostics.elapsedMs = elapsed(started);
+      metadataDiagnostics.attempt = attempt;
+
+      if (keepActive) {
+        active.set(infoHash, { torrent, createdAt: Date.now(), metadata });
+
+        const cleanupTimer = setTimeout(() => {
+          const entry = active.get(infoHash);
+          if (entry?.torrent === torrent) {
+            active.delete(infoHash);
+            void destroyTorrent(torrent);
+          }
+        }, 10 * 60 * 1000);
+        cleanupTimer.unref?.();
+      } else {
+        await destroyTorrent(torrent);
+      }
+
+      await finishCleanup(keepActive ? torrent : null);
+      resolve(metadata);
+    };
+
+    const finishFailure = async error => {
+      if (finished) return;
+      finished = true;
+
+      metadataDiagnostics.phase = 'failed';
+      metadataDiagnostics.infoHash = infoHash;
+      metadataDiagnostics.elapsedMs = elapsed(started);
+
+      await finishCleanup(null);
+      reject(error);
+    };
+
+    const handleAttemptFailure = error => {
+      completed += 1;
+      console.warn('[METADATA] attempt finished without metadata', {
+        completed,
+        total: plans.length,
+        error: error?.message || String(error)
+      });
+      if (!finished && completed >= plans.length) {
+        void finishFailure(new Error(
+          'Metadata resolution failed after ' + plans.length +
+          ' parallel attempts (' + elapsed(started) + 'ms): ' +
+          (error?.message || 'no metadata received')
+        ));
+      }
+    };
+
+    plans.forEach((plan, index) => {
+      const attempt = index + 1;
+      const launch = () => {
+        if (finished) return;
+
+        const entry = startMetadataAttempt(
+          normalizedMagnet,
+          plan,
+          attempt,
+          keepActive,
+          started,
+          infoHash,
+          () => {}
+        );
+        attempts.push(entry);
+
+        metadataDiagnostics.phase = attempt === 1 ? 'discovering' : 'fallback-discovering';
+        metadataDiagnostics.attempt = attempt;
+        metadataDiagnostics.trackers = plan.trackers.length;
+
+        entry.promise
+          .then(result => finishSuccess(result))
+          .catch(handleAttemptFailure);
+      };
+
+      if (plan.delayMs === 0) {
+        launch();
+      } else {
+        const timer = setTimeout(launch, plan.delayMs);
+        timer.unref?.();
+        startTimers.push(timer);
+      }
+    });
+  });
 }
 
 async function resolveMetadata(magnet, keepActive = true) {
