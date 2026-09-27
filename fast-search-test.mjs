@@ -15,9 +15,9 @@ const TORRENTS_CSV_URL = 'https://torrents-csv.com/service/search';
 const APIBAY_URL = 'https://apibay.org/q.php';
 
 const TRACKERS = [
-  'udp://tracker.opentrackr.org:1337/announce',
-  'udp://open.stealth.si:80/announce',
-  'udp://tracker.torrent.eu.org:451/announce'
+  'http://tracker.dler.org:6969/announce',
+  'http://tracker2.dler.org:80/announce',
+  'http://1337.abcvg.info:80/announce'
 ];
 
 const client = new WebTorrent({
